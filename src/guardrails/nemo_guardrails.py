@@ -13,14 +13,14 @@ except ImportError:
 
 
 # ============================================================
-# NeMo YAML config — model and rails settings
+# NeMo YAML config — model and rails settings (OpenRouter)
 # ============================================================
 
 NEMO_YAML_CONFIG = textwrap.dedent("""\
     models:
       - type: main
-        engine: google
-        model: gemini-3.1-flash-lite
+        engine: openai
+        model: {OPENROUTER_MODEL}
 
     rails:
       input:
@@ -117,12 +117,17 @@ def init_nemo():
         print("Skipping NeMo init — nemoguardrails not installed.")
         return None
 
+    from core.config import OPENROUTER_MODEL
+
+    # Fill in the model name
+    yaml_content = NEMO_YAML_CONFIG.replace("{OPENROUTER_MODEL}", OPENROUTER_MODEL)
+
     config = RailsConfig.from_content(
-        yaml_content=NEMO_YAML_CONFIG,
+        yaml_content=yaml_content,
         colang_content=COLANG_CONFIG,
     )
     nemo_rails = LLMRails(config)
-    print("NeMo Guardrails initialized.")
+    print(f"NeMo Guardrails initialized (model: {OPENROUTER_MODEL}).")
     return nemo_rails
 
 

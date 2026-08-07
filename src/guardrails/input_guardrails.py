@@ -5,6 +5,7 @@ Lab 11 — Part 2A: Input Guardrails
   TODO 3: Input Guardrail Plugin (ADK)
 """
 import re
+import unicodedata
 
 from google.genai import types
 from google.adk.plugins import base_plugin
@@ -27,10 +28,38 @@ from core.config import ALLOWED_TOPICS, BLOCKED_TOPICS
 # - "pretend you are"
 # - "act as (a |an )?unrestricted"
 # Also handle an instruction embedded in an untrusted email/RAG document, e.g.
-# ``Ignore\u200b all previous instructions``. Do not block a benign request to
+# ``Ignore all previous instructions``. Do not block a benign request to
 # summarize an external bank-transfer email just because it is external data.
 # Regex is one signal, not the whole security boundary.
 # ============================================================
+
+# Zero-width characters that could be used to hide injection
+ZERO_WIDTH_CHARS = re.compile(
+    r'[\u200b-\u200f\ufeff\u00ad\u180e\u180b-\u180f'
+    r'\u2000-\u200a\u2028-\u2029\u2060-\u2064]'
+)
+
+
+def _normalize_text(text: str) -> str:
+    """Normalize text: NFKC, remove zero-width chars, lowercase.
+
+    This helps detect injections hidden with:
+    - Unicode lookalikes (homoglyphs)
+    - Zero-width spaces/joiner
+    - Invisible formatting characters
+    """
+    # Step 1: Decompose and recompose using NFKC (normalizes compatibility chars)
+    normalized = unicodedata.normalize('NFKC', text)
+
+    # Step 2: Remove zero-width and invisible characters
+    normalized = ZERO_WIDTH_CHARS.sub('', normalized)
+
+    # Step 3: Normalize whitespace (collapse multiple spaces, strip)
+    normalized = re.sub(r'\s+', ' ', normalized).strip()
+
+    # Step 4: Lowercase for comparison
+    return normalized.lower()
+
 
 def detect_injection(user_input: str) -> bool:
     """Detect prompt injection patterns in user input.
@@ -41,15 +70,33 @@ def detect_injection(user_input: str) -> bool:
     Returns:
         True if injection detected, False otherwise
     """
+    # Normalize the text first to detect hidden injections
+    normalized = _normalize_text(user_input)
+
+    # Injection patterns to detect command override attempts
     INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
+        # Ignore previous instructions variants
+        r'ignore\s+(all\s+)?(previous|above)\s+instructions',
+        # Role play overrides
+        r'you\s+are\s+now\s+',
+        r'pretend\s+you\s+are',
+        r'act\s+as\s+(a\s+|an\s+)?unrestricted',
+        # System prompt manipulation
+        r'system\s+prompt',
+        r'reveal\s+your\s+(instructions|prompt)',
+        # Jailbreak patterns
+        r'dan\s+mode',
+        r'jailbreak',
+        # Override keywords
+        r'ignore\s+your\s+',
+        r'disregard\s+(all\s+)?your\s+',
+        r'forget\s+(all\s+)?previous',
     ]
 
     for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+        if re.search(pattern, normalized, re.IGNORECASE):
             return True
+
     return False
 
 
@@ -74,12 +121,18 @@ def topic_filter(user_input: str) -> bool:
     """
     input_lower = user_input.lower()
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return True
-    # 2. If input doesn't contain any allowed topic -> return True
-    # 3. Otherwise -> return False (allow)
+    # 1. Check if input contains any blocked topic -> block immediately
+    for blocked in BLOCKED_TOPICS:
+        if blocked in input_lower:
+            return True
 
-    pass  # Replace with your implementation
+    # 2. Check if input contains any allowed topic -> allow
+    for allowed in ALLOWED_TOPICS:
+        if allowed in input_lower:
+            return False
+
+    # 3. No allowed topic found -> block as off-topic
+    return True
 
 
 # ============================================================
@@ -132,14 +185,26 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If True: increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If True: increment blocked_count, return self._block_response("...")
-        # 3. If both are False: return None (let message through)
+        # 1. Check for injection patterns
+        if detect_injection(text):
+            self.blocked_count += 1
+            return self._block_response(
+                "I cannot process this request. It appears to contain "
+                "instructions that attempt to override my behavior. "
+                "Please rephrase your question."
+            )
 
-        pass  # Replace with your implementation
+        # 2. Check if topic is allowed
+        if topic_filter(text):
+            self.blocked_count += 1
+            return self._block_response(
+                "I'm sorry, but I can only assist with banking-related "
+                "inquiries such as accounts, transactions, loans, and "
+                "savings. Please ask a banking question."
+            )
+
+        # 3. Both checks passed -> let message through
+        return None
 
 
 # ============================================================

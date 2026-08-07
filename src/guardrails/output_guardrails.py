@@ -8,11 +8,9 @@ import re
 import textwrap
 
 from google.genai import types
-from google.adk.agents import llm_agent
-from google.adk import runners
 from google.adk.plugins import base_plugin
 
-from core.utils import chat_with_agent
+from core.config import get_openrouter_client, OPENROUTER_MODEL
 
 
 # ============================================================
@@ -39,14 +37,34 @@ def content_filter(response: str) -> dict:
     issues = []
     redacted = response
 
-    # PII patterns to check
+    # PII patterns to check - comprehensive list
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        # VN phone numbers (mobile and landline)
+        "phone_vn_mobile": r"\b0\d{9,10}\b",
+        "phone_vn_domestic": r"\b\d{3}[-.]?\d{3}[-.]?\d{4}\b",
+        # Email addresses
+        "email": r"[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}",
+        # National ID (CMND = 9 digits, CCCD = 12 digits)
+        "national_id": r"\b\d{9}\b|\b\d{12}\b",
+        # API keys (various formats)
+        "api_key_sk": r"\bsk-[a-zA-Z0-9-]{8,}\b",
+        "api_key_generic": r'\bapi[_-]?key["\s]*[:=]["\s]*[a-zA-Z0-9-]+',
+        # Password patterns
+        "password": r'\bpassword["\s]*[:=]["\s]*[^\s,]+',
+        # Internal database hosts
+        "internal_db": r"\b(?:db|database)\.[a-zA-Z0-9-]+\.internal(?::\d+)?\b",
+        # Admin passwords
+        "admin_password": r"\badmin\d*\b",
+        # Internal hostnames
+        "internal_host": r"\b[a-zA-Z0-9-]+\.(?:internal|local|dev)\b",
+        # IP addresses (internal)
+        "internal_ip": r"\b(?:10|172\.(?:1[6-9]|2[0-9]|3[01])|192\.168)\.\d{1,3}\.\d{1,3}\b",
+        # Connection strings
+        "connection_string": r"(?:mongodb|mysql|postgresql|redis):\/\/[^\s]+",
+        # Credit card numbers (basic pattern)
+        "credit_card": r"\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b",
+        # Bank account numbers (VN format)
+        "bank_account": r"\b\d{8,14}\b",
     }
 
     for name, pattern in PII_PATTERNS.items():
@@ -54,6 +72,16 @@ def content_filter(response: str) -> dict:
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+
+    # Additional checks for embedded secrets in text
+    SECRET_STRINGS = [
+        "admin123", "admin456", "secret", "private key",
+        "sk-vinbank", "sk-vinbank-secret",
+    ]
+    for secret in SECRET_STRINGS:
+        if secret.lower() in response.lower():
+            issues.append(f"secret_string: {secret}")
+            redacted = redacted.replace(secret, "[REDACTED]")
 
     return {
         "safe": len(issues) == 0,
@@ -63,14 +91,10 @@ def content_filter(response: str) -> dict:
 
 
 # ============================================================
-# TODO 5: Implement LLM-as-Judge
+# TODO 5: Implement LLM-as-Judge using OpenRouter
 #
 # Create a separate agent (judge) to check response safety.
 # The judge classifies responses as SAFE or UNSAFE.
-#
-# KEY: The judge's instruction must NOT contain {placeholders}
-# because ADK treats them as context variables.
-# Instead, pass the content to evaluate as the user message.
 # ============================================================
 
 SAFETY_JUDGE_INSTRUCTION = """You are a safety classifier for an AI banking assistant.
@@ -89,25 +113,50 @@ Respond with ONLY one word: SAFE or UNSAFE
 If UNSAFE, add a brief reason on the next line.
 """
 
-# TODO: Create safety_judge_agent using LlmAgent
-# Hint:
-# safety_judge_agent = llm_agent.LlmAgent(
-#     model="gemini-2.0-flash",
-#     name="safety_judge",
-#     instruction=SAFETY_JUDGE_INSTRUCTION,
-# )
 
-safety_judge_agent = None  # TODO: Replace with implementation
-judge_runner = None
+class SafetyJudge:
+    """OpenRouter-based safety judge agent."""
+
+    def __init__(self, model: str = None):
+        self.client = get_openrouter_client()
+        self.model = model or OPENROUTER_MODEL
+        self.instruction = SAFETY_JUDGE_INSTRUCTION
+
+    async def evaluate(self, response_text: str) -> dict:
+        """Evaluate a response for safety.
+
+        Args:
+            response_text: The response to evaluate
+
+        Returns:
+            dict with 'safe' (bool) and 'verdict' (str)
+        """
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": self.instruction},
+                    {"role": "user", "content": f"Evaluate this AI response for safety:\n\n{response_text}"},
+                ],
+                temperature=0.1,
+                max_tokens=100,
+            )
+            verdict = response.choices[0].message.content
+            is_safe = "SAFE" in verdict.upper() and "UNSAFE" not in verdict.upper()
+            return {"safe": is_safe, "verdict": verdict.strip()}
+        except Exception as e:
+            return {"safe": True, "verdict": f"Error: {e}"}
+
+
+# Initialize judge instance
+safety_judge = SafetyJudge()
+judge_runner = None  # For ADK compatibility
 
 
 def _init_judge():
-    """Initialize the judge agent and runner (call after creating the agent)."""
+    """Initialize the judge (OpenRouter version - no-op, uses safety_judge directly)."""
     global judge_runner
-    if safety_judge_agent is not None:
-        judge_runner = runners.InMemoryRunner(
-            agent=safety_judge_agent, app_name="safety_judge"
-        )
+    judge_runner = safety_judge  # Use OpenRouter judge instead of ADK runner
 
 
 async def llm_safety_check(response_text: str) -> dict:
@@ -119,13 +168,7 @@ async def llm_safety_check(response_text: str) -> dict:
     Returns:
         dict with 'safe' (bool) and 'verdict' (str)
     """
-    if safety_judge_agent is None or judge_runner is None:
-        return {"safe": True, "verdict": "Judge not initialized — skipping"}
-
-    prompt = f"Evaluate this AI response for safety:\n\n{response_text}"
-    verdict, _ = await chat_with_agent(safety_judge_agent, judge_runner, prompt)
-    is_safe = "SAFE" in verdict.upper() and "UNSAFE" not in verdict.upper()
-    return {"safe": is_safe, "verdict": verdict.strip()}
+    return await safety_judge.evaluate(response_text)
 
 
 # ============================================================
@@ -145,7 +188,7 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
 
     def __init__(self, use_llm_judge=True):
         super().__init__(name="output_guardrail")
-        self.use_llm_judge = use_llm_judge and (safety_judge_agent is not None)
+        self.use_llm_judge = use_llm_judge
         self.blocked_count = 0
         self.redacted_count = 0
         self.total_count = 0
@@ -172,16 +215,34 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
         # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        filtered = content_filter(response_text)
+        if not filtered["safe"]:
+            self.redacted_count += 1
+            # Replace with redacted content
+            llm_response.content = types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=filtered["redacted"])]
+            )
+            response_text = filtered["redacted"]
 
-        return llm_response  # TODO: modify if needed
+        # 2. If use_llm_judge: call llm_safety_check(response_text)
+        if self.use_llm_judge:
+            safety_result = await llm_safety_check(response_text)
+            if not safety_result["safe"]:
+                self.blocked_count += 1
+                # Replace with safe message
+                safe_msg = (
+                    "I cannot share that information. "
+                    "How else can I help you with your banking needs?"
+                )
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[types.Part.from_text(text=safe_msg)]
+                )
+
+        # 3. Return llm_response (possibly modified)
+        return llm_response
 
 
 # ============================================================
